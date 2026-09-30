@@ -1,0 +1,114 @@
+name: supabase-pooler-s3-airflow
+
+x-airflow-common: &airflow-common
+  build: .
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    # The scheduler signs served-log requests and the webserver verifies them.
+    # This value must therefore be identical in every Airflow container.
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:-local-dev-airflow-log-signing-key-change-before-production}
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    MLFLOW_EXPERIMENT_NAME: supabase-s3-employment-training
+    S3_EXPORT_BUCKET: ${S3_EXPORT_BUCKET:?Set S3_EXPORT_BUCKET in .env}
+    S3_EXPORT_PREFIX: ${S3_EXPORT_PREFIX:-raw/supabase-pooler-export}
+    S3_TRAINING_RUN_ID: ${S3_TRAINING_RUN_ID:-}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-2}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    MIN_ROC_AUC: ${MIN_ROC_AUC:-0.70}
+    ARTIFACTS_DIR: /opt/airflow/artifacts
+    RAW_DATA_DIR: /opt/airflow/artifacts/raw
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./app:/opt/airflow/app
+    - ./artifacts:/opt/airflow/artifacts
+  depends_on:
+    postgres:
+      condition: service_healthy
+    mlflow:
+      condition: service_started
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+
+  mlflow-db-init:
+    build: .
+    entrypoint: ["python", "/opt/airflow/scripts/init_mlflow_db.py"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mlflow-storage-init:
+    build: .
+    user: root
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /mlflow/artifacts && chown -R airflow:root /mlflow"]
+    volumes:
+      - mlflow-data:/mlflow
+
+  mlflow:
+    build: .
+    entrypoint: ["mlflow"]
+    command: >-
+      server --host 0.0.0.0 --port 5000
+      --backend-store-uri postgresql+psycopg2://airflow:airflow@postgres:5432/mlflow
+      --serve-artifacts
+      --artifacts-destination /mlflow/artifacts
+    depends_on:
+      mlflow-db-init:
+        condition: service_completed_successfully
+      mlflow-storage-init:
+        condition: service_completed_successfully
+    volumes:
+      - mlflow-data:/mlflow
+    ports:
+      - "5002:5000"
+
+  airflow-init:
+    <<: *airflow-common
+    command: >-
+      bash -c "airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Airflow --lastname Admin --role Admin --email admin@example.com || true"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8083:8080"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  mlflow-data:
